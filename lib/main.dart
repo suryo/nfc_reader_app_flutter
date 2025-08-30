@@ -1,122 +1,298 @@
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:nfc_manager/nfc_manager.dart';
+
+// Penting untuk akses kelas platform v4:
+import 'package:nfc_manager/nfc_manager_android.dart';
+import 'package:nfc_manager/nfc_manager_ios.dart';
+
+// NDEF abstraction (lintas platform)
+import 'package:nfc_manager_ndef/nfc_manager_ndef.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const NFCReaderApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class NFCReaderApp extends StatelessWidget {
+  const NFCReaderApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'NFC Reader',
+      theme: ThemeData(useMaterial3: true),
+      home: const NFCReaderPage(),
+      debugShowCheckedModeBanner: false,
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class NFCReaderPage extends StatefulWidget {
+  const NFCReaderPage({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<NFCReaderPage> createState() => _NFCReaderPageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _NFCReaderPageState extends State<NFCReaderPage> {
+  bool _isScanning = false;
+  String _status = 'Tekan "Scan NFC", lalu tempelkan kartu/tag ke belakang HP.';
+  String? _uidHex;
+  String? _tech;
+  String? _ndefSummary;
 
-  void _incrementCounter() {
+  @override
+  void dispose() {
+    NfcManager.instance.stopSession();
+    super.dispose();
+  }
+
+  Future<void> _startScan() async {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isScanning = true;
+      _status = 'Memulai sesi NFC...';
+      _uidHex = null;
+      _tech = null;
+      _ndefSummary = null;
     });
+
+    final available = await NfcManager.instance.isAvailable();
+    if (!available) {
+      setState(() {
+        _isScanning = false;
+        _status = 'NFC tidak tersedia/aktif di perangkat ini.';
+      });
+      return;
+    }
+
+    await NfcManager.instance.startSession(
+      // Aman untuk Android & iOS (FeliCa/iso18092 opsional: butuh entitlements tambahan di iOS)
+      pollingOptions: {NfcPollingOption.iso14443, NfcPollingOption.iso15693},
+      onDiscovered: (NfcTag tag) async {
+        try {
+          final uid = _extractIdentifier(tag);
+          final techs = _detectTechs(tag).join(', ');
+          final ndefInfo = await _tryReadNdef(tag);
+
+          setState(() {
+            _uidHex = uid;
+            _tech = techs.isEmpty ? null : techs;
+            _ndefSummary = ndefInfo;
+            _status = uid == null
+                ? 'Tag terdeteksi (UID mungkin tidak diekspos pada tipe/perangkat ini).'
+                : 'Tag terdeteksi! UID: $uid';
+          });
+        } catch (e) {
+          setState(() => _status = 'Gagal membaca tag: $e');
+        } finally {
+          await NfcManager.instance.stopSession();
+          if (mounted) setState(() => _isScanning = false);
+        }
+      },
+    );
+
+    setState(() => _status = 'Tempelkan kartu/tag ke belakang HP…');
+  }
+
+  Future<void> _stopScan() async {
+    await NfcManager.instance.stopSession();
+    setState(() {
+      _isScanning = false;
+      _status = 'Sesi dihentikan.';
+    });
+  }
+
+  /// Deteksi teknologi utama (kelas vendor-specific v4).
+  List<String> _detectTechs(NfcTag tag) {
+    final t = <String>[];
+
+    // ---------- ANDROID ----------
+    try {
+      if (NfcAAndroid.from(tag) != null) t.add('NfcA');
+      if (NfcBAndroid.from(tag) != null) t.add('NfcB');
+      if (NfcFAndroid.from(tag) != null) t.add('NfcF');
+      if (NfcVAndroid.from(tag) != null) t.add('NfcV');
+      if (IsoDepAndroid.from(tag) != null) t.add('IsoDep');
+      if (MifareClassicAndroid.from(tag) != null) t.add('MifareClassic');
+      if (MifareUltralightAndroid.from(tag) != null) t.add('MifareUltralight');
+      if (NdefAndroid.from(tag) != null) t.add('Ndef');
+    } catch (_) {}
+
+    // ---------- iOS ----------
+    try {
+      if (MiFareIos.from(tag) != null) t.add('MiFare');
+      if (FeliCaIos.from(tag) != null) t.add('FeliCa');
+      if (Iso15693Ios.from(tag) != null) t.add('Iso15693');
+      if (Iso7816Ios.from(tag) != null) t.add('Iso7816');
+      if (NdefIos.from(tag) != null) t.add('Ndef');
+    } catch (_) {}
+
+    return t;
+  }
+
+  /// Ambil UID (identifier) jika tersedia. iOS bisa berbeda/terbatas.
+  String? _extractIdentifier(NfcTag tag) {
+    Uint8List? id;
+
+    // ---------- ANDROID: pakai NfcTagAndroid.id ----------
+    final aTag = NfcTagAndroid.from(tag);
+    if (aTag != null) {
+      id = aTag.id; // UID/serial di Android v4
+    }
+
+    // ---------- iOS ----------
+    id ??= MiFareIos.from(tag)?.identifier;
+    id ??= FeliCaIos.from(tag)?.currentIDm;   // FeliCa punya IDm
+    id ??= Iso15693Ios.from(tag)?.identifier;
+    id ??= Iso7816Ios.from(tag)?.identifier;
+
+    return id == null ? null : _bytesToHex(id);
+  }
+
+  /// Baca NDEF (pakai nfc_manager_ndef).
+  Future<String?> _tryReadNdef(NfcTag tag) async {
+    final ndef = Ndef.from(tag);
+    if (ndef == null) return 'Tag tidak mendukung NDEF.';
+
+    // Coba pakai pesan yang sudah di-cache saat discovery; jika null, read().
+    final message = ndef.cachedMessage ?? await ndef.read(); // NdefMessage?
+
+    if (message == null || message.records.isEmpty) return 'NDEF kosong.';
+
+    final buf = StringBuffer();
+    for (var i = 0; i < message.records.length; i++) {
+      final r = message.records[i];
+      buf.writeln('• Record #${i + 1}');
+      buf.writeln('  TNF: ${r.typeNameFormat}');
+      buf.writeln('  Type: ${String.fromCharCodes(r.type)}');
+      if (r.payload.isNotEmpty) {
+        final txt = _safePayloadPreview(r.payload);
+        buf.writeln('  Payload: $txt');
+      }
+    }
+    return buf.toString().trim();
+  }
+
+  String _safePayloadPreview(Uint8List bytes) {
+    final s = String.fromCharCodes(bytes);
+    return s.length > 120 ? '${s.substring(0, 120)}…' : s;
+  }
+
+  String _bytesToHex(Uint8List bytes) {
+    final sb = StringBuffer();
+    for (final b in bytes) {
+      sb.write(b.toRadixString(16).padLeft(2, '0').toUpperCase());
+    }
+    return sb.toString();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
+      appBar: AppBar(title: const Text('NFC Reader'), centerTitle: true),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: ListView(
+          children: [
+            // Panel UID besar + tombol salin
+            if (_uidHex != null)
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: SelectableText(
+                          'UID: ${_uidHex!}',
+                          style: theme.textTheme.headlineSmall,
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Salin UID',
+                        onPressed: () async {
+                          await Clipboard.setData(ClipboardData(text: _uidHex!));
+                          if (!mounted) return;
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('UID disalin ke clipboard')),
+                          );
+                        },
+                        icon: const Icon(Icons.copy),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+            // Status
+            Text(_status, style: theme.textTheme.bodyLarge),
+            const SizedBox(height: 16),
+
+            // Info Tech & NDEF
+            if (_tech != null) _InfoTile(title: 'Tech', value: _tech!),
+            if (_ndefSummary != null)
+              _InfoTile(title: 'NDEF', value: _ndefSummary!),
+
+            const SizedBox(height: 16),
+
+            // Tombol aksi
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _isScanning ? null : _startScan,
+                    icon: const Icon(Icons.nfc),
+                    label: const Text('Scan NFC'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _isScanning ? _stopScan : null,
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop'),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 12),
             Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+              'Tips:\n'
+              '• Gunakan perangkat nyata (emulator tidak mendukung NFC)\n'
+              '• Aktifkan NFC di pengaturan\n'
+              '• iOS: UID/identifier bisa terbatas tergantung jenis tag',
+              style: theme.textTheme.bodySmall,
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+}
+
+class _InfoTile extends StatelessWidget {
+  final String title;
+  final String value;
+  const _InfoTile({required this.title, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: SelectableText.rich(
+          TextSpan(
+            children: [
+              TextSpan(text: '$title\n', style: theme.textTheme.titleSmall),
+              TextSpan(text: value, style: theme.textTheme.bodyMedium),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

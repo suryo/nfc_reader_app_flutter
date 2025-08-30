@@ -6,9 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.nfc_reader_app"
+     namespace = "com.example.nfc_reader_app"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+
+    // Pakai NDK yang diminta plugin
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
